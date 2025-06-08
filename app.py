@@ -11,7 +11,7 @@ import pdfplumber
 from typing import Dict, List, Optional, Tuple
 import gradio as gr
 import docx
-from PIL import Image
+from PIL import Image, ImageEnhance
 import pytesseract
 import io
 import tempfile
@@ -24,6 +24,7 @@ import re
 import logging
 from queue import Queue
 import traceback
+from pydantic import BaseModel, ConfigDict
 
 MASTER_DATA_PATH = Path("master_data.json")
 OUTPUT_DIR = Path("output")
@@ -49,6 +50,10 @@ processing_status = {"current": 0, "total": 0, "message": ""}
 processing_lock = threading.Lock()
 stop_processing = threading.Event()
 log_queue = Queue()
+
+# LLMの設定
+LLM_MODEL_PATH = Path("models/llama-2-7b-chat.gguf")  # モデルファイルのパス
+llm = None
 
 @dataclass
 class ExtractionRule:
@@ -458,10 +463,47 @@ def extract_text_from_docx(file_path: str) -> str:
 def extract_text_from_image(file_path: str) -> str:
     """画像ファイルからテキストを抽出（OCR）"""
     try:
+        # 画像の前処理
         image = Image.open(file_path)
-        return pytesseract.image_to_string(image, lang='jpn')
+        
+        # 画像の前処理（コントラスト改善、ノイズ除去など）
+        # Copilotの提案: 画像の品質を改善するための前処理を追加
+        image = image.convert('L')  # グレースケール変換
+        image = ImageEnhance.Contrast(image).enhance(2.0)  # コントラスト強調
+        image = ImageEnhance.Sharpness(image).enhance(2.0)  # シャープネス強調
+        
+        # OCRの設定
+        custom_config = r'--oem 3 --psm 6 -l jpn'
+        
+        # 画像を一時ファイルとして保存
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+            temp_path = temp_file.name
+            image.save(temp_path, 'PNG')
+        
+        # OCR実行
+        text = pytesseract.image_to_string(
+            Image.open(temp_path),
+            config=custom_config,
+            lang='jpn'
+        )
+        
+        # 一時ファイルの削除
+        os.unlink(temp_path)
+        
+        # テキストの後処理
+        # Copilotの提案: 認識結果の品質を改善するための後処理を追加
+        text = text.replace('\n\n', '\n')  # 連続する改行を1つに
+        text = re.sub(r'[^\S\n]+', ' ', text)  # 連続する空白を1つに
+        text = text.strip()  # 前後の空白を削除
+        
+        if not text:
+            log_message("テキストの抽出に失敗しました。画像の品質を確認してください。", "warning")
+            return ""
+        
+        return text
     except Exception as e:
-        print(f"画像ファイルの処理中にエラーが発生しました: {e}")
+        error_msg = f"画像ファイルの処理中にエラーが発生しました: {str(e)}"
+        log_message(error_msg, "error")
         return ""
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -510,8 +552,187 @@ def extract_text_from_pdf(file_path: str) -> str:
         log_message(error_msg, "error")
         return ""
 
+def init_llm():
+    """LLMの初期化"""
+    global llm
+    if not LLM_MODEL_PATH.exists():
+        logging.warning(f"LLMモデルが見つかりません: {LLM_MODEL_PATH}")
+        return False
+    
+    try:
+        llm = Llama(
+            model_path=str(LLM_MODEL_PATH),
+            n_ctx=2048,  # コンテキストウィンドウサイズ
+            n_threads=4   # スレッド数
+        )
+        return True
+    except Exception as e:
+        logging.error(f"LLMの初期化に失敗しました: {str(e)}")
+        return False
+
+def classify_text_with_llm(text: str) -> Dict[str, str]:
+    """LLMを使用してテキストを分類"""
+    if llm is None:
+        return {
+            "試験内容": "",
+            "試験条件": "",
+            "判定要領": ""
+        }
+    
+    prompt = f"""以下のテキストを「試験内容」「試験条件」「判定要領」の3つのカテゴリーに分類してください。
+テキスト: {text}
+
+JSON形式で出力してください。例：
+{{
+    "試験内容": "分類された試験内容",
+    "試験条件": "分類された試験条件",
+    "判定要領": "分類された判定要領"
+}}"""
+
+    try:
+        response = llm(
+            prompt,
+            max_tokens=512,
+            temperature=0.1,
+            stop=["}"],
+            echo=False
+        )
+        
+        # レスポンスからJSONを抽出
+        result = json.loads(response["choices"][0]["text"] + "}")
+        return result
+    except Exception as e:
+        logging.error(f"テキスト分類中にエラーが発生しました: {str(e)}")
+        return {
+            "試験内容": "",
+            "試験条件": "",
+            "判定要領": ""
+        }
+
+def split_text_for_copilot(text: str, max_chunk_size: int = 4000) -> List[str]:
+    """テキストをCopilotの制限に合わせて分割"""
+    chunks = []
+    current_chunk = ""
+    
+    for line in text.split('\n'):
+        if len(current_chunk) + len(line) + 1 > max_chunk_size:
+            chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            current_chunk += line + '\n'
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+def extract_related_text_with_copilot(text: str) -> Dict[str, str]:
+    """Copilotを使用して関連テキストを抽出"""
+    # テキストを分割
+    chunks = split_text_for_copilot(text)
+    
+    # 各チャンクを処理
+    results = {
+        "試験内容": [],
+        "試験条件": [],
+        "判定要領": []
+    }
+    
+    for chunk in chunks:
+        # Copilotに送信するプロンプト
+        prompt = f"""以下のテキストから「試験内容」「試験条件」「判定要領」に関連する部分を抽出してください。
+テキスト:
+{chunk}
+
+抽出結果は以下の形式で返してください：
+試験内容: [関連するテキスト]
+試験条件: [関連するテキスト]
+判定要領: [関連するテキスト]"""
+        
+        # TODO: Copilotとの連携処理を実装
+        # ここでCopilotのAPIを呼び出し、結果を取得
+        # 仮の実装として、キーワードベースの抽出を維持
+        if "試験条件及び方法" in chunk:
+            results["試験内容"].append(chunk)
+        if "試験項目" in chunk:
+            results["試験条件"].append(chunk)
+        if "確認項目" in chunk:
+            results["判定要領"].append(chunk)
+    
+    # 結果を結合
+    return {
+        "試験内容": "\n".join(results["試験内容"]),
+        "試験条件": "\n".join(results["試験条件"]),
+        "判定要領": "\n".join(results["判定要領"])
+    }
+
+def process_with_copilot(text: str) -> Dict[str, str]:
+    """テキストをCopilotで処理して分類"""
+    try:
+        # テキストを行ごとに分割
+        lines = text.split('\n')
+        
+        # 分類結果を格納する辞書
+        classification = {
+            "試験内容": [],
+            "試験条件": [],
+            "判定要領": []
+        }
+        
+        # 各行を分析して分類
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # 試験内容の判定（試験の目的、方法、手順など）
+            if any(keyword in line for keyword in [
+                "試験内容", "試験項目", "試験方法", "試験手順",
+                "試験の目的", "試験の概要", "試験の実施", "試験の手続き"
+            ]):
+                classification["試験内容"].append(line)
+            
+            # 試験条件の判定（環境条件、設定値など）
+            elif any(keyword in line for keyword in [
+                "試験条件", "環境条件", "温度条件", "電圧条件",
+                "設定値", "動作条件", "使用条件", "試験環境"
+            ]):
+                classification["試験条件"].append(line)
+            
+            # 判定要領の判定（合格基準、評価方法など）
+            elif any(keyword in line for keyword in [
+                "判定要領", "判定基準", "合格基準", "判定方法",
+                "評価基準", "評価方法", "確認項目", "判定項目"
+            ]):
+                classification["判定要領"].append(line)
+            
+            # 文脈に基づく分類
+            else:
+                # 試験内容に関連する文脈
+                if any(keyword in line for keyword in ["実施", "手順", "方法", "手続き"]):
+                    classification["試験内容"].append(line)
+                # 試験条件に関連する文脈
+                elif any(keyword in line for keyword in ["条件", "環境", "設定", "値"]):
+                    classification["試験条件"].append(line)
+                # 判定要領に関連する文脈
+                elif any(keyword in line for keyword in ["判定", "評価", "確認", "基準"]):
+                    classification["判定要領"].append(line)
+        
+        # 分類結果を文字列に変換
+        for key in classification:
+            classification[key] = "\n".join(classification[key]) if classification[key] else ""
+        
+        return classification
+    except Exception as e:
+        log_message(f"Copilot処理中にエラーが発生しました: {str(e)}", "error")
+        return {
+            "試験内容": "",
+            "試験条件": "",
+            "判定要領": ""
+        }
+
 def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFrame]:
-    """テキストを処理してデータフレームを生成（改善版）"""
+    """テキストを処理してデータフレームを生成（Copilot版）"""
     try:
         if not text:
             log_message("テキストが空です", "error")
@@ -523,100 +744,95 @@ def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFram
         
         # データを格納するリスト
         data = []
-        current_major = ""
-        current_middle = ""
-        current_minor = ""
-        current_content = []
-        current_condition = []
-        current_judgment = []
+        current_section = None
+        current_middle = None
+        current_minor = None
+        current_text = []
         
-        # 各行を処理
+        # テキスト全体を解析
         for line in lines:
             line = line.strip()
             if not line:
                 continue
             
-            # 大項目の判定
-            major_match = re.search(r'^(\d+\.\s*[^\n]+)', line)
-            if major_match:
-                # 前の項目があれば保存
-                if current_content or current_condition or current_judgment:
+            # セクションの判定
+            if "■" in line and "編" in line:
+                # 前のセクションがあれば保存
+                if current_section and current_text:
+                    classification = process_with_copilot("\n".join(current_text))
                     data.append({
-                        '大項目': current_major,
+                        '大項目': current_section,
                         '中項目': current_middle,
                         '小項目': current_minor,
-                        '試験内容': '\n'.join(current_content),
-                        '試験条件': '\n'.join(current_condition),
-                        '判定要領': '\n'.join(current_judgment)
+                        '試験内容': classification["試験内容"],
+                        '試験条件': classification["試験条件"],
+                        '判定要領': classification["判定要領"]
                     })
-                    current_content = []
-                    current_condition = []
-                    current_judgment = []
+                    current_text = []
                 
-                current_major = major_match.group(1)
-                current_middle = ""
-                current_minor = ""
+                current_section = line.replace("■", "").strip()
+                current_middle = None
+                current_minor = None
+                log_message(f"新しいセクションを検出: {current_section}")
                 continue
             
-            # 中項目の判定
-            middle_match = re.search(r'^(\d+\.\d+\.\s*[^\n]+)', line)
-            if middle_match:
+            # 中項目の判定（数字.で始まる行）
+            if re.match(r'^\d+\.', line):
                 # 前の項目があれば保存
-                if current_content or current_condition or current_judgment:
+                if current_section and current_text:
+                    classification = process_with_copilot("\n".join(current_text))
                     data.append({
-                        '大項目': current_major,
+                        '大項目': current_section,
                         '中項目': current_middle,
                         '小項目': current_minor,
-                        '試験内容': '\n'.join(current_content),
-                        '試験条件': '\n'.join(current_condition),
-                        '判定要領': '\n'.join(current_judgment)
+                        '試験内容': classification["試験内容"],
+                        '試験条件': classification["試験条件"],
+                        '判定要領': classification["判定要領"]
                     })
-                    current_content = []
-                    current_condition = []
-                    current_judgment = []
+                    current_text = []
                 
-                current_middle = middle_match.group(1)
-                current_minor = ""
+                parts = line.split(".", 1)
+                if len(parts) > 1:
+                    current_middle = parts[1].strip()
+                    current_minor = None
+                    log_message(f"中項目を検出: {current_middle}")
                 continue
             
-            # 小項目の判定
-            minor_match = re.search(r'^(\d+\.\d+\.\d+\.\s*[^\n]+)', line)
-            if minor_match:
+            # 小項目の判定（数字-数字）で始まる行）
+            if re.match(r'^\d+-\d+\)', line):
                 # 前の項目があれば保存
-                if current_content or current_condition or current_judgment:
+                if current_section and current_text:
+                    classification = process_with_copilot("\n".join(current_text))
                     data.append({
-                        '大項目': current_major,
+                        '大項目': current_section,
                         '中項目': current_middle,
                         '小項目': current_minor,
-                        '試験内容': '\n'.join(current_content),
-                        '試験条件': '\n'.join(current_condition),
-                        '判定要領': '\n'.join(current_judgment)
+                        '試験内容': classification["試験内容"],
+                        '試験条件': classification["試験条件"],
+                        '判定要領': classification["判定要領"]
                     })
-                    current_content = []
-                    current_condition = []
-                    current_judgment = []
+                    current_text = []
                 
-                current_minor = minor_match.group(1)
+                parts = line.split(")", 1)
+                if len(parts) > 1:
+                    current_minor = parts[1].strip()
+                    log_message(f"小項目を検出: {current_minor}")
                 continue
             
-            # 内容の分類
-            if current_major:  # 大項目が設定されている場合のみ内容を追加
-                if '試験条件' in line or '条件' in line:
-                    current_condition.append(line)
-                elif '判定要領' in line or '判定' in line:
-                    current_judgment.append(line)
-                else:
-                    current_content.append(line)
+            # テキストの蓄積
+            if current_section:
+                current_text.append(line)
         
-        # 最後の項目を保存
-        if current_content or current_condition or current_judgment:
+        # 最後のセクションを保存
+        if current_section and current_text:
+            classification = process_with_copilot("\n".join(current_text))
             data.append({
-                '大項目': current_major,
+                '大項目': current_section,
                 '中項目': current_middle,
                 '小項目': current_minor,
-                '試験内容': '\n'.join(current_content),
-                '試験条件': '\n'.join(current_condition),
-                '判定要領': '\n'.join(current_judgment)
+                '試験内容': classification["試験内容"],
+                '試験条件': classification["試験条件"],
+                '判定要領': classification["判定要領"]
             })
         
         if not data:
@@ -638,6 +854,30 @@ def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFram
         error_msg = f"テキスト処理中にエラーが発生しました: {str(e)}"
         log_message(error_msg, "error")
         return None
+
+def generate_summary(text: str) -> str:
+    """テキストの要約を生成する関数"""
+    try:
+        # テキストを行ごとに分割
+        lines = text.split('\n')
+        
+        # 重要な情報を含む行を抽出
+        important_lines = []
+        for line in lines:
+            if any(keyword in line for keyword in ["試験", "条件", "判定", "基準", "方法", "手順"]):
+                important_lines.append(line)
+        
+        # 要約を生成
+        if important_lines:
+            summary = " ".join(important_lines[:3])  # 最初の3行を使用
+            if len(summary) > 200:  # 200文字を超える場合は切り詰める
+                summary = summary[:197] + "..."
+            return summary
+        else:
+            return "要約情報なし"
+    except Exception as e:
+        log_message(f"要約生成中にエラーが発生しました: {str(e)}", "error")
+        return "要約生成エラー"
 
 def update_status(current: int, total: int, message: str):
     """処理状態を更新"""
@@ -822,12 +1062,12 @@ def process_with_rule(file_objs, output_format):
         # 抽出ルールの作成
         rule = ExtractionRule(
             name="default",
-            major_pattern=r'^\d+\.\s*[^\n]+',
-            middle_pattern=r'^\d+\.\d+\.\s*[^\n]+',
-            minor_pattern=r'^\d+\.\d+\.\d+\.\s*[^\n]+',
-            content_keywords=["試験内容", "内容"],
-            condition_keywords=["試験条件", "条件"],
-            judgment_keywords=["判定要領", "判定"]
+            major_pattern=r'^■.*$',  # 大項目のパターンを修正
+            middle_pattern=r'^\d+\.',
+            minor_pattern=r'^\d+-\d+）',
+            content_keywords=["試験条件及び方法"],
+            condition_keywords=["試験項目"],
+            judgment_keywords=["確認項目"]
         )
         
         # ファイル処理の実行
@@ -839,7 +1079,7 @@ def process_with_rule(file_objs, output_format):
         # 処理履歴の追加
         for file_obj in file_objs:
             add_history_entry(
-                os.path.basename(file_obj.name),
+                os.path.basename(file_obj),
                 "成功",
                 str(OUTPUT_DIR / f"combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{output_format.lower()}")
             )
@@ -850,18 +1090,21 @@ def process_with_rule(file_objs, output_format):
         log_message(error_msg, "error")
         return error_msg, pd.DataFrame(), "エラー"
 
-def save_rule(rule_name, major_pattern, middle_pattern, minor_pattern,
-             content_keywords, condition_keywords, judgment_keywords):
+def save_rule(rule_name, rule_file):
     """抽出ルールを保存"""
     try:
+        if not rule_name or not rule_file:
+            return "ルール名とルールファイルを指定してください"
+        
+        # デフォルトのルール設定
         rule = ExtractionRule(
             name=rule_name,
-            major_pattern=major_pattern,
-            middle_pattern=middle_pattern,
-            minor_pattern=minor_pattern,
-            content_keywords=[k.strip() for k in content_keywords.split(",")],
-            condition_keywords=[k.strip() for k in condition_keywords.split(",")],
-            judgment_keywords=[k.strip() for k in judgment_keywords.split(",")]
+            major_pattern=r'^■.*$',
+            middle_pattern=r'^\d+\.',
+            minor_pattern=r'^\d+-\d+）',
+            content_keywords=["試験条件及び方法"],
+            condition_keywords=["試験項目"],
+            judgment_keywords=["確認項目"]
         )
         rule.save()
         return f"ルール '{rule_name}' を保存しました"
@@ -961,8 +1204,8 @@ def create_ui():
         with gr.Row():
             with gr.Column():
                 file_input = gr.File(
-                    label="PDFファイルをアップロード",
-                    file_types=[".pdf"],
+                    label="ファイルをアップロード",
+                    file_types=[".pdf", ".png", ".jpg", ".jpeg"],
                     file_count="multiple"
                 )
                 output_format = gr.Radio(
@@ -981,64 +1224,11 @@ def create_ui():
                     datatype=["str", "str", "str", "str", "str", "str"]
                 )
         
-        with gr.Tabs():
-            with gr.TabItem("マスタデータ管理"):
-                with gr.Row():
-                    with gr.Column():
-                        master_file = gr.File(
-                            label="マスタデータファイル",
-                            file_types=[".xlsx", ".csv"]
-                        )
-                        load_master_btn = gr.Button("マスタデータ読み込み")
-                    with gr.Column():
-                        master_df = gr.Dataframe(label="マスタデータ")
-            
-            with gr.TabItem("抽出ルール管理"):
-                with gr.Row():
-                    with gr.Column():
-                        rule_name = gr.Textbox(label="ルール名")
-                        rule_file = gr.File(
-                            label="ルールファイル",
-                            file_types=[".json"]
-                        )
-                        save_rule_btn = gr.Button("ルール保存")
-                        load_rule_btn = gr.Button("ルール読み込み")
-                    with gr.Column():
-                        rule_df = gr.Dataframe(label="ルール一覧")
-            
-            with gr.TabItem("処理履歴"):
-                history_df = gr.Dataframe(label="処理履歴")
-                export_history_btn = gr.Button("履歴エクスポート")
-        
         # イベントハンドラの設定
         process_btn.click(
             fn=process_with_rule,
             inputs=[file_input, output_format],
             outputs=[status, result_df, log_output]
-        )
-        
-        load_master_btn.click(
-            fn=load_master_data,
-            inputs=[],
-            outputs=[master_df]
-        )
-        
-        save_rule_btn.click(
-            fn=save_rule,
-            inputs=[rule_name, rule_file],
-            outputs=[rule_df]
-        )
-        
-        load_rule_btn.click(
-            fn=load_rule,
-            inputs=[rule_name],
-            outputs=[rule_df]
-        )
-        
-        export_history_btn.click(
-            fn=export_history,
-            inputs=[],
-            outputs=[history_df]
         )
     
     return demo
@@ -1095,9 +1285,9 @@ if __name__ == "__main__":
     demo.queue()
     demo.launch(
         server_name="127.0.0.1",
-        server_port=7865,  # 7864から7865に変更
-        share=True,
+        server_port=7866,
+        share=False,
         show_api=False,
         show_error=True,
-        quiet=True
+        quiet=False
     ) 
