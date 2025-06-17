@@ -288,7 +288,7 @@ class PDFProcessor:
                             continue
                         
                         # 中項目の検出
-                        if line[0].isdigit() and '.' in line[:3]:
+                        if re.match(r'^\d+[.．]', line):
                             if current_minor_data:
                                 all_data.append(current_minor_data)
                                 current_minor_data = {}
@@ -776,8 +776,8 @@ def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFram
                 log_message(f"新しいセクションを検出: {current_section}")
                 continue
             
-            # 中項目の判定（数字.で始まる行）
-            if re.match(r'^\d+\.', line):
+            # 中項目の判定（数字.または数字．で始まる行）
+            if re.match(r'^\d+[.．]', line):
                 # 前の項目があれば保存
                 if current_section and current_text:
                     classification = process_with_copilot("\n".join(current_text))
@@ -791,7 +791,8 @@ def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFram
                     })
                     current_text = []
                 
-                parts = line.split(".", 1)
+                # 半角ドットと全角ドットの両方に対応
+                parts = re.split(r'[.．]', line, 1)
                 if len(parts) > 1 and not re.match(r'^[\d\s]+$', parts[1].strip()):
                     current_middle = line
                     current_minor = None
