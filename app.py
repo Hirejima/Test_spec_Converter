@@ -792,8 +792,8 @@ def process_text(text: str, rule: ExtractionRule = None) -> Optional[pd.DataFram
                     current_text = []
                 
                 parts = line.split(".", 1)
-                if len(parts) > 1:
-                    current_middle = parts[1].strip()
+                if len(parts) > 1 and not re.match(r'^[\d\s]+$', parts[1].strip()):
+                    current_middle = line
                     current_minor = None
                     log_message(f"中項目を検出: {current_middle}")
                 continue
